@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="description" content="Echo Loop: a 2D arena game where every death becomes an ally. Your past lives replay and fight beside you.">
+<meta name="theme-color" content="#05060f">
+<title>Echo Loop</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2305060f'/%3E%3Ccircle cx='32' cy='32' r='8' fill='%2335e6ff'/%3E%3Ccircle cx='32' cy='32' r='16' fill='none' stroke='%23c455ff' stroke-width='3' opacity='.8'/%3E%3Ccircle cx='32' cy='32' r='24' fill='none' stroke='%2335e6ff' stroke-width='2' opacity='.4'/%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; background: #05060f; overflow: hidden; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; overscroll-behavior: none; }
+  canvas { position: fixed; left: 0; top: 0; display: block; cursor: crosshair; outline: none; }
+  noscript { color: #9fb4ff; font: 16px system-ui, sans-serif; position: fixed; inset: 0; display: grid; place-items: center; }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="Echo Loop game"></canvas>
+<noscript>Echo Loop needs JavaScript enabled to run.</noscript>
+
+<script>
+(() => {
+'use strict';
+
+/* ============================================================
+   ECHO LOOP
+   Survive 40-second loops. When you die (or time runs out),
+   your recorded life becomes an ECHO that replays every loop
+   and fights beside you. Stack up to 6 echoes.
+   ============================================================ */
+
+const W = 960, H = 600, FPS = 60, STEP = 1000 / FPS;
+const LOOP_T = 40 * FPS, MAX_LOOPS = 6;
+const SP = 3.4, NOVA_R = 150, NOVA_CD = 150;
+const HUES = [290, 150, 45, 200, 335, 100];
+const SANS = '"Trebuchet MS","Segoe UI",system-ui,-apple-system,sans-serif';
+const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1, ox = 0, oy = 0, dpr = 1;
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  cv.width = Math.floor(innerWidth * dpr);
+  cv.height = Math.floor(innerHeight * dpr);
+  cv.style.width = innerWidth + 'px';
+  cv.style.height = innerHeight + 'px';
+  scale = Math.min(innerWidth / W, innerHeight / H);
+  ox = (innerWidth - W * scale) / 2;
+  oy = (innerHeight - H * scale) / 2;
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---------- helpers ---------- */
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const hsl = (h, s, l, a = 1) => `hsla(${h},${s}%,${l}%,${a})`;
+function circle(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); }
+function poly(x, y, r, n, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const a = rot + (i / n) * Math.PI * 2;
+    const px = x + Math.cos(a) * r, py = y + Math.sin(a) * r;
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.closePath();
+}
+function text(s, x, y, size, col, align = 'left', weight = '700', font = SANS) {
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = col;
+  ctx.fillText(s, x, y);
+}
+
+/* ---------- audio (tiny synth, no files) ---------- */
+let AC = null, muted = false;
+const lastSnd = {};
+try { muted = localStorage.getItem('echoloop_mute') === '1'; } catch (e) {}
+function beep(f, d, type = 'square', v = 0.04, slide = 0, key = null) {
+  if (muted) return;
+  const now = performance.now();
+  if (key) { if (now - (lastSnd[key] || 0) < 45) return; lastSnd[key] = now; }
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === 'suspended') AC.resume();
+    const o = AC.createOscillator(), g = AC.createGain(), t = AC.currentTime;
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), t + d);
+    g.gain.setValueAtTime(v, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t + d);
+  } catch (e) {}
+}
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('echoloop_mute', muted ? '1' : '0'); } catch (e) {}
+  if (!muted) beep(660, .1, 'sine', .05);
+}
+
+/* ---------- enemy definitions ---------- */
+const TYPES = {
+  drifter:  { r: 10, hp: 1, sp: 1.05, pts: 10, hue: 352, n: 0 },
+  swift:    { r: 8,  hp: 1, sp: 1.9,  pts: 15, hue: 28,  n: 3 },
+  splitter: { r: 13, hp: 3, sp: 0.85, pts: 20, hue: 125, n: 5 },
+  brute:    { r: 19, hp: 7, sp: 0.62, pts: 40, hue: 268, n: 6 },
+};
+
+/* ---------- game state ---------- */
+let state = 'title';           // title | play | between | over
+let paused = false;
+let loopNo = 0, tick = 0, spawnT = 30, deathT = 0;
+let score = 0, dispScore = 0, best = 0, newBest = false;
+let stats = { me: 0, echo: 0 };      // whole run
+let lstats = { me: 0, echo: 0 };     // this loop
+let lastSurvived = false;
+let ghosts = [], ghostsActive = [];
+let P, enemies = [], bullets = [], parts = [], rings = [], shards = [], pops = [];
+let rec = { x: [], y: [] }, recNova = [];
+let shake = 0, banner = { txt: '', life: 0, hue: 190 };
+let novaReq = false, overlayT = 0, anim = 0, isTouch = false;
+try { best = +localStorage.getItem('echoloop_best') || 0; } catch (e) {}
+
+const keys = {};
+const pointer = { x: W / 2, y: H / 2, active: false };
+let movePid = -1;
+const NB = { x: W - 85, y: H - 85, r: 48 };
+
+/* ---------- game flow ---------- */
+function newGame() {
+  ghosts = []; score = 0; dispScore = 0; loopNo = 0; newBest = false;
+  stats = { me: 0, echo: 0 };
+  startLoop();
+}
+function startLoop() {
+  loopNo++; tick = 0; deathT = 0; spawnT = 30;
+  P = { x: W / 2, y: H / 2, r: 9, fire: 5, nova: 60, boost: 0, alive: true };
+  rec = { x: [], y: [] }; recNova = [];
+  enemies = []; bullets = []; parts = []; rings = []; shards = []; pops = [];
+  ghostsActive = [];
+  for (const g of ghosts) g.fire = 10;
+  lstats = { me: 0, echo: 0 };
+  shake = 0; paused = false; state = 'play';
+  banner = { txt: loopNo === 1 ? 'LOOP 1' : `LOOP ${loopNo}  ·  ${ghosts.length} ${ghosts.length === 1 ? 'ECHO' : 'ECHOES'} ARMED`, life: 110, hue: 190 };
+  beep(440, .12, 'sine', .05); setTimeout(() => beep(660, .15, 'sine', .05), 90);
+}
+function endLoop(survived) {
+  if (state !== 'play') return;
+  const len = rec.x.length;
+  ghosts.push({
+    x: rec.x, y: rec.y, nova: new Set(recNova), hue: HUES[(loopNo - 1) % HUES.length],
+    len, survived, cx: rec.x[len - 1], cy: rec.y[len - 1], fire: 10
+  });
+  lastSurvived = survived;
+  if (survived) {
+    score += 250;
+    for (const e of enemies.slice()) kill(e, 'me', true);
+    shake = 14;
+    [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => beep(f, .18, 'triangle', .06), i * 90));
+  }
+  enemies = enemies.filter(e => !e.dead);
+  if (score > best) {
+    best = score; newBest = true;
+    try { localStorage.setItem('echoloop_best', String(best)); } catch (e) {}
+  }
+  state = loopNo >= MAX_LOOPS ? 'over' : 'between';
+  overlayT = 0;
+}
+function killPlayer() {
+  if (!P.alive) return;
+  P.alive = false; deathT = 0;
+  burst(P.x, P.y, 190, 46, 5);
+  rings.push({ x: P.x, y: P.y, r: 6, max: 90, hue: 190 });
+  shake = 18;
+  beep(220, .7, 'sawtooth', .09, -190);
+  banner = { txt: 'YOUR LIFE BECOMES AN ECHO', life: 90, hue: 290 };
+}
+
+/* ---------- spawning ---------- */
+function pickType() {
+  const r = Math.random();
+  if (loopNo >= 3 && r < 0.06 + 0.02 * loopNo) return 'brute';
+  if (loopNo >= 2 && r < 0.30) return 'swift';
+  if (loopNo >= 2 && r < 0.46) return 'splitter';
+  return 'drifter';
+}
+function edgePos() {
+  const s = (Math.random() * 4) | 0, m = 30;
+  if (s === 0) return [rnd(0, W), -m];
+  if (s === 1) return [W + m, rnd(0, H)];
+  if (s === 2) return [rnd(0, W), H + m];
+  return [-m, rnd(0, H)];
+}
+function safeEdge() {
+  let p = edgePos();
+  for (let i = 0; i < 6; i++) {
+    if (Math.hypot(p[0] - P.x, p[1] - P.y) > 170) break;
+    p = edgePos();
+  }
+  return p;
+}
+function spawn(type, x, y) {
+  const T = TYPES[type];
+  enemies.push({
+    type, x, y, r: T.r, hp: T.hp, mhp: T.hp,
+    sp: T.sp + loopNo * 0.05 + rnd(0, 0.15),
+    pts: T.pts, hue: T.hue, n: T.n, flash: 0, rot: 0, dead: false
+  });
+}
+
+/* ---------- combat ---------- */
+function nearest(x, y, range) {
+  let best = null, bd = range * range;
+  for (const e of enemies) {
+    if (e.dead || e.x < -5 || e.x > W + 5 || e.y < -5 || e.y > H + 5) continue;
+    const dx = e.x - x, dy = e.y - y, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = e; }
+  }
+  return best;
+}
+function shoot(x, y, e, owner, hue, speed) {
+  const a = Math.atan2(e.y - y, e.x - x);
+  bullets.push({ x, y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, life: 46, owner, hue, dmg: 1, dead: false });
+}
+function hit(e, d, owner) {
+  if (e.dead) return;
+  e.hp -= d; e.flash = 5;
+  if (e.hp <= 0) kill(e, owner);
+}
+function kill(e, owner, noSplit) {
+  if (e.dead) return;
+  e.dead = true;
+  score += e.pts; stats[owner]++; lstats[owner]++;
+  burst(e.x, e.y, e.hue, e.r > 14 ? 26 : 12, 3.2);
+  if (e.pts >= 20) pops.push({ x: e.x, y: e.y - 10, txt: '+' + e.pts, life: 40, hue: e.hue });
+  if (e.type === 'splitter' && !noSplit) {
+    for (let k = 0; k < 2; k++) spawn('drifter', e.x + rnd(-10, 10), e.y + rnd(-10, 10));
+  }
+  if (!noSplit && Math.random() < 0.10) shards.push({ x: e.x, y: e.y, life: 480 });
+  beep(owner === 'me' ? 260 : 200, .09, 'triangle', owner === 'me' ? .035 : .02, -110, 'kill');
+  if (e.r > 14) shake = Math.max(shake, 5);
+}
+function doNova(x, y, owner, hue) {
+  rings.push({ x, y, r: 10, max: NOVA_R, hue: hue == null ? 190 : hue });
+  for (const e of enemies.slice()) {
+    if (e.dead) continue;
+    const dx = e.x - x, dy = e.y - y, d = Math.hypot(dx, dy);
+    if (d < NOVA_R + e.r) {
+      const f = 1 - d / (NOVA_R + e.r);
+      e.x += dx / (d || 1) * 60 * f; e.y += dy / (d || 1) * 60 * f;
+      hit(e, 3, owner);
+    }
+  }
+  if (owner === 'me') { shake = Math.max(shake, 7); beep(110, .35, 'sawtooth', .07, -60); }
+  else beep(140, .25, 'sawtooth', .025, -70, 'enova');
+}
+function burst(x, y, hue, n, speed = 3) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, Math.PI * 2), s = rnd(0.4, speed), life = rnd(20, 46) | 0;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, hue, size: rnd(1.5, 3.4) });
+  }
+  if (parts.length > 800) parts.splice(0, parts.length - 800);
+}
+
+/* ---------- simulation ---------- */
+function fxStep() {
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.vx *= 0.96; p.vy *= 0.96; p.life--; }
+  parts = parts.filter(p => p.life > 0);
+  for (const r of rings) r.r += (r.max - r.r) * 0.16 + 1;
+  rings = rings.filter(r => r.r < r.max - 1.5);
+  for (const p of pops) { p.y -= 0.5; p.life--; }
+  pops = pops.filter(p => p.life > 0);
+  if (shake > 0) shake *= 0.88;
+  if (banner.life > 0) banner.life--;
+}
+
+function step() {
+  const t = tick;
+
+  /* spawning */
+  if (P.alive) {
+    if (--spawnT <= 0) {
+      spawnT = Math.max(9, 50 - loopNo * 4 - (t / FPS) * 0.7);
+      const [x, y] = safeEdge(); spawn(pickType(), x, y);
+    }
+    if (t === 600 || t === 1200 || t === 1800) {
+      banner = { txt: 'SWARM INCOMING', life: 110, hue: 352 };
+      const n = 4 + loopNo * 2;
+      for (let i = 0; i < n; i++) { const [x, y] = safeEdge(); spawn(pickType(), x, y); }
+      beep(150, .4, 'sawtooth', .05, -60);
+    }
+  }
+
+  /* player */
+  if (P.alive) {
+    let mx = (keys.d || keys.arrowright ? 1 : 0) - (keys.a || keys.arrowleft ? 1 : 0);
+    let my = (keys.s || keys.arrowdown ? 1 : 0) - (keys.w || keys.arrowup ? 1 : 0);
+    const sp = P.boost > 0 ? SP * 1.18 : SP;
+    if (mx || my) {
+      const l = Math.hypot(mx, my); P.x += mx / l * sp; P.y += my / l * sp;
+    } else if (pointer.active) {
+      const dx = pointer.x - P.x, dy = pointer.y - P.y, d = Math.hypot(dx, dy);
+      if (d > 5) { const s = Math.min(sp, d * 0.18); P.x += dx / d * s; P.y += dy / d * s; }
+    }
+    P.x = clamp(P.x, 12, W - 12); P.y = clamp(P.y, 12, H - 12);
+    rec.x[t] = P.x; rec.y[t] = P.y;
+    if (P.boost > 0) P.boost--;
+
+    if (--P.fire <= 0) {
+      const e = nearest(P.x, P.y, 340);
+      if (e) { shoot(P.x, P.y, e, 'me', 185, 9); P.fire = P.boost > 0 ? 6 : 12; beep(760 + rnd(0, 90), .04, 'square', .012, 0, 'shot'); }
+      else P.fire = 3;
+    }
+    if (P.nova > 0) P.nova--;
+    if (novaReq && P.nova <= 0) { doNova(P.x, P.y, 'me', 190); recNova.push(t); P.nova = NOVA_CD; }
+
+    for (const s of shards) {
+      if (Math.hypot(s.x - P.x, s.y - P.y) < 18) {
+        s.life = 0; P.boost = 300; score += 25;
+        pops.push({ x: P.x, y: P.y - 18, txt: 'OVERDRIVE', life: 50, hue: 50 });
+        beep(880, .14, 'sine', .05, 420);
+      }
+    }
+  }
+  novaReq = false;
+  for (const s of shards) s.life--;
+  shards = shards.filter(s => s.life > 0);
+
+  /* echoes */
+  ghostsActive.length = 0;
+  for (const g of ghosts) {
+    if (t < g.len) {
+      g.cx = g.x[t]; g.cy = g.y[t];
+      ghostsActive.push(g);
+      if (--g.fire <= 0) {
+        const e = nearest(g.cx, g.cy, 260);
+        if (e) { shoot(g.cx, g.cy, e, 'echo', g.hue, 8); g.fire = 20; } else g.fire = 4;
+      }
+      if (g.nova.has(t)) doNova(g.cx, g.cy, 'echo', g.hue);
+    } else if (t === g.len && g.len < LOOP_T) {
+      burst(g.cx, g.cy, g.hue, 24, 3);
+      rings.push({ x: g.cx, y: g.cy, r: 4, max: 50, hue: g.hue });
+    }
+  }
+
+  /* bullets */
+  for (const b of bullets) {
+    b.x += b.vx; b.y += b.vy; b.life--;
+    if (b.life <= 0 || b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20) { b.dead = true; continue; }
+    for (const e of enemies) {
+      if (e.dead) continue;
+      const dx = e.x - b.x, dy = e.y - b.y, rr = e.r + 3;
+      if (dx * dx + dy * dy < rr * rr) {
+        hit(e, b.dmg, b.owner); b.dead = true;
+        parts.push({ x: b.x, y: b.y, vx: rnd(-1, 1), vy: rnd(-1, 1), life: 10, max: 10, hue: b.hue, size: 2 });
+        break;
+      }
+    }
+  }
+  bullets = bullets.filter(b => !b.dead);
+
+  /* enemies */
+  for (const e of enemies) {
+    if (e.dead) continue;
+    let tx = null, ty = 0, bd = 1e9;
+    if (P.alive) { tx = P.x; ty = P.y; bd = Math.hypot(P.x - e.x, P.y - e.y); }
+    for (const g of ghostsActive) {
+      const d = Math.hypot(g.cx - e.x, g.cy - e.y) * 1.25;
+      if (d < bd) { bd = d; tx = g.cx; ty = g.cy; }
+    }
+    if (tx !== null) {
+      const dx = tx - e.x, dy = ty - e.y, d = Math.hypot(dx, dy) || 1;
+      e.x += dx / d * e.sp; e.y += dy / d * e.sp;
+      e.rot = Math.atan2(dy, dx);
+    }
+    if (e.flash > 0) e.flash--;
+    for (const g of ghostsActive) {
+      if (Math.hypot(g.cx - e.x, g.cy - e.y) < e.r + 16) hit(e, 0.05, 'echo');
+    }
+    if (!e.dead && P.alive && Math.hypot(P.x - e.x, P.y - e.y) < e.r + P.r - 3) killPlayer();
+  }
+  // soft separation so swarms spread out
+  for (let i = 0; i < enemies.length; i++) {
+    const a = enemies[i]; if (a.dead) continue;
+    for (let j = i + 1; j < enemies.length; j++) {
+      const b = enemies[j]; if (b.dead) continue;
+      const dx = b.x - a.x, dy = b.y - a.y, min = (a.r + b.r) * 0.85;
+      if (Math.abs(dx) > min || Math.abs(dy) > min) continue;
+      const d = Math.hypot(dx, dy) || 0.01;
+      if (d < min) { const p = (min - d) * 0.25 / d; a.x -= dx * p; a.y -= dy * p; b.x += dx * p; b.y += dy * p; }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead);
+
+  fxStep();
+  tick++;
+
+  if (!P.alive) { if (++deathT > 85) endLoop(false); }
+  else if (tick >= LOOP_T) endLoop(true);
+}
+
+/* ---------- rendering ---------- */
+function drawWorld() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, 560);
+  g.addColorStop(0, '#111737'); g.addColorStop(1, '#05060f');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = 'rgba(120,150,255,.06)'; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = 0; x <= W; x += 40) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y <= H; y += 40) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+
+  // the loop clock: sweeps as the loop progresses; echo deaths are marked on it
+  ctx.lineWidth = 10; ctx.strokeStyle = 'rgba(120,200,255,.07)';
+  circle(W / 2, H / 2, 230); ctx.stroke();
+  ctx.strokeStyle = 'rgba(120,220,255,.26)';
+  ctx.beginPath(); ctx.arc(W / 2, H / 2, 230, -Math.PI / 2, -Math.PI / 2 + Math.min(1, tick / LOOP_T) * Math.PI * 2); ctx.stroke();
+  for (const gh of ghosts) {
+    if (gh.len >= LOOP_T) continue;
+    const a = -Math.PI / 2 + (gh.len / LOOP_T) * Math.PI * 2;
+    ctx.fillStyle = hsl(gh.hue, 90, 65, .9);
+    circle(W / 2 + Math.cos(a) * 230, H / 2 + Math.sin(a) * 230, 5); ctx.fill();
+  }
+
+  for (const r of rings) {
+    const a = 1 - r.r / r.max;
+    ctx.strokeStyle = hsl(r.hue, 95, 70, a * .9); ctx.lineWidth = 3 + a * 4;
+    circle(r.x, r.y, r.r); ctx.stroke();
+  }
+
+  for (const s of shards) {
+    if (s.life < 90 && ((s.life / 6) | 0) % 2) continue;
+    const bob = Math.sin((anim + s.x) * 0.1) * 2;
+    ctx.fillStyle = hsl(50, 100, 60, .25); circle(s.x, s.y + bob, 13); ctx.fill();
+    ctx.fillStyle = hsl(50, 100, 65); poly(s.x, s.y + bob, 7, 4, Math.PI / 4); ctx.fill();
+  }
+
+  // echoes
+  for (const gh of ghosts) {
+    if (tick >= gh.len) continue;
+    ctx.strokeStyle = hsl(gh.hue, 90, 65, .22); ctx.lineWidth = 1.5; ctx.setLineDash([3, 6]);
+    ctx.beginPath(); ctx.moveTo(gh.cx, gh.cy);
+    for (let k = 6; k <= 90 && tick + k < gh.len; k += 6) ctx.lineTo(gh.x[tick + k], gh.y[tick + k]);
+    ctx.stroke(); ctx.setLineDash([]);
+    for (let k = 3; k <= 15 && tick - k >= 0; k += 3) {
+      ctx.fillStyle = hsl(gh.hue, 90, 65, 0.22 - k * 0.012);
+      circle(gh.x[tick - k], gh.y[tick - k], 8 - k * 0.3); ctx.fill();
+    }
+    ctx.fillStyle = hsl(gh.hue, 90, 60, .22); circle(gh.cx, gh.cy, 18); ctx.fill();
+    ctx.strokeStyle = hsl(gh.hue, 90, 72, .95); ctx.lineWidth = 2; circle(gh.cx, gh.cy, 9); ctx.stroke();
+    ctx.fillStyle = hsl(gh.hue, 90, 85, .9); circle(gh.cx, gh.cy, 3); ctx.fill();
+  }
+
+  // enemies
+  for (const e of enemies) {
+    ctx.fillStyle = hsl(e.hue, 90, 55, .18); circle(e.x, e.y, e.r + 6); ctx.fill();
+    ctx.fillStyle = e.flash > 0 ? '#fff' : hsl(e.hue, 80, 52);
+    ctx.strokeStyle = hsl(e.hue, 90, 75); ctx.lineWidth = 2;
+    if (e.n === 0) circle(e.x, e.y, e.r); else poly(e.x, e.y, e.r, e.n, e.rot);
+    ctx.fill(); ctx.stroke();
+    if (e.type === 'drifter') { ctx.fillStyle = '#1a0710'; circle(e.x + Math.cos(e.rot) * 3, e.y + Math.sin(e.rot) * 3, 3); ctx.fill(); }
+    if (e.mhp > 1 && e.hp < e.mhp) {
+      ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(e.x - 14, e.y - e.r - 9, 28, 4);
+      ctx.fillStyle = hsl(e.hue, 90, 70); ctx.fillRect(e.x - 14, e.y - e.r - 9, 28 * Math.max(0, e.hp / e.mhp), 4);
+    }
+  }
+
+  // bullets
+  for (const b of bullets) {
+    ctx.fillStyle = hsl(b.hue, 95, 65, .3); circle(b.x, b.y, 6); ctx.fill();
+    ctx.fillStyle = hsl(b.hue, 95, 88); circle(b.x, b.y, 2.6); ctx.fill();
+  }
+
+  // player
+  if (P && P.alive) {
+    const boosted = P.boost > 0;
+    ctx.fillStyle = boosted ? hsl(50, 100, 60, .25) : hsl(190, 100, 60, .2); circle(P.x, P.y, 22); ctx.fill();
+    ctx.fillStyle = '#eaffff'; circle(P.x, P.y, 7); ctx.fill();
+    ctx.strokeStyle = boosted ? hsl(50, 100, 65) : hsl(190, 100, 62); ctx.lineWidth = 3; circle(P.x, P.y, P.r); ctx.stroke();
+    if (P.nova <= 0) {
+      ctx.strokeStyle = hsl(190, 100, 70, .35 + Math.sin(anim * 0.2) * .2); ctx.lineWidth = 1.5;
+      circle(P.x, P.y, 16); ctx.stroke();
+    }
+  }
+
+  for (const p of parts) {
+    ctx.fillStyle = hsl(p.hue, 95, 68, p.life / p.max);
+    ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  for (const p of pops) text(p.txt, p.x, p.y, 15, hsl(p.hue, 95, 75, Math.min(1, p.life / 20)), 'center', '800');
+
+  if (!isTouch && pointer.active && state === 'play' && !paused) {
+    ctx.strokeStyle = 'rgba(160,230,255,.5)'; ctx.lineWidth = 1.5;
+    circle(pointer.x, pointer.y, 8); ctx.stroke();
+  }
+}
+
+function fmt(n) { return Math.round(n).toLocaleString('en-US'); }
+
+function drawHUD() {
+  text('SCORE', 20, 20, 12, 'rgba(160,180,255,.6)', 'left', '700', MONO);
+  text(fmt(dispScore), 20, 42, 28, '#eaf0ff', 'left', '800');
+  text('best ' + fmt(best), 20, 66, 13, 'rgba(160,180,255,.55)', 'left', '600', MONO);
+
+  // timeline
+  const bx = W / 2 - 160, by = 22, bw = 320;
+  ctx.fillStyle = 'rgba(255,255,255,.08)'; ctx.fillRect(bx, by, bw, 6);
+  ctx.fillStyle = hsl(190, 100, 62); ctx.fillRect(bx, by, bw * Math.min(1, tick / LOOP_T), 6);
+  for (const g of ghosts) {
+    const gx = bx + bw * Math.min(1, g.len / LOOP_T);
+    ctx.fillStyle = hsl(g.hue, 90, 65);
+    ctx.beginPath(); ctx.moveTo(gx, by + 9); ctx.lineTo(gx - 4, by + 16); ctx.lineTo(gx + 4, by + 16); ctx.closePath(); ctx.fill();
+  }
+  const left = Math.max(0, Math.ceil((LOOP_T - tick) / FPS));
+  text(left + 's', bx + bw + 12, by + 3, 14, 'rgba(200,220,255,.8)', 'left', '700', MONO);
+
+  // loop + echo pips
+  text(`loop ${Math.min(loopNo, MAX_LOOPS)} / ${MAX_LOOPS}`, W - 54, 20, 15, '#eaf0ff', 'right', '700', MONO);
+  for (let i = 0; i < MAX_LOOPS; i++) {
+    const g = ghosts[i];
+    ctx.strokeStyle = g ? hsl(g.hue, 90, 65) : 'rgba(255,255,255,.2)'; ctx.lineWidth = 2;
+    ctx.fillStyle = g ? hsl(g.hue, 90, 60, .5) : 'transparent';
+    circle(W - 60 - (MAX_LOOPS - 1 - i) * 18, 44, 5.5); ctx.fill(); ctx.stroke();
+  }
+  // sound toggle
+  text(muted ? '\u00d7' : '\u266a', W - 22, 22, 22, muted ? 'rgba(255,120,140,.9)' : 'rgba(160,220,255,.85)', 'center', '700');
+
+  // nova meter
+  if (P) {
+    const ready = P.nova <= 0, w = 150;
+    ctx.fillStyle = 'rgba(255,255,255,.08)'; ctx.fillRect(20, H - 30, w, 8);
+    ctx.fillStyle = ready ? hsl(190, 100, 65) : hsl(210, 60, 50);
+    ctx.fillRect(20, H - 30, w * (1 - P.nova / NOVA_CD), 8);
+    text(ready ? 'nova ready' : 'nova charging', 20, H - 44, 12, ready ? hsl(190, 100, 75) : 'rgba(160,180,255,.55)', 'left', '700', MONO);
+    if (P.boost > 0) {
+      ctx.fillStyle = hsl(50, 100, 60); ctx.fillRect(20, H - 56, w * (P.boost / 300), 4);
+    }
+  }
+  if (isTouch) {
+    const ready = P && P.nova <= 0;
+    ctx.fillStyle = ready ? hsl(190, 100, 60, .28) : 'rgba(255,255,255,.07)'; circle(NB.x, NB.y, NB.r); ctx.fill();
+    ctx.strokeStyle = ready ? hsl(190, 100, 70) : 'rgba(255,255,255,.25)'; ctx.lineWidth = 3; circle(NB.x, NB.y, NB.r); ctx.stroke();
+    text('NOVA', NB.x, NB.y, 16, ready ? '#eaffff' : 'rgba(255,255,255,.45)', 'center', '800');
+  }
+
+  // banner
+  if (banner.life > 0) {
+    const a = Math.min(1, banner.life / 25);
+    text(banner.txt, W / 2, 96, 26, hsl(banner.hue, 95, 72, a), 'center', '800');
+  }
+  // coaching for the first few seconds
+  if (state === 'play' && tick < 420) {
+    const a = Math.min(1, (420 - tick) / 60);
+    let tip = null;
+    if (loopNo === 1) tip = isTouch ? 'Drag to move. Your ship auto-fires. Tap NOVA to blast.' : 'Move with mouse or WASD. Your ship auto-fires. Click or Space fires a nova.';
+    else if (loopNo === 2) tip = 'Your echo is replaying your last life. Herd enemies into it.';
+    else if (loopNo === 3) tip = 'Echoes stack. Plan a route that lets them cover you.';
+    if (tip) text(tip, W / 2, H - 28, 16, `rgba(200,220,255,${a * .85})`, 'center', '600');
+  }
+}
+
+function panel(h) {
+  ctx.fillStyle = 'rgba(5,6,15,.78)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(14,18,44,.92)';
+  ctx.strokeStyle = 'rgba(140,170,255,.25)'; ctx.lineWidth = 2;
+  const x = W / 2 - 300, y = H / 2 - h / 2;
+  ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, 600, h, 18) : ctx.rect(x, y, 600, h);
+  ctx.fill(); ctx.stroke();
+  return y;
+}
+function blink(s, y) {
+  const a = 0.55 + Math.sin(anim * 0.08) * 0.4;
+  text(s, W / 2, y, 18, `rgba(150,235,255,${a})`, 'center', '800');
+}
+function drawTitle() {
+  const g = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, 560);
+  g.addColorStop(0, '#141a42'); g.addColorStop(1, '#05060f');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 18; i++) {
+    const a = anim * 0.004 * (1 + i % 3) + i * 1.7;
+    const x = W / 2 + Math.cos(a) * (120 + i * 22), y = H / 2 + Math.sin(a * 1.3) * (80 + i * 13);
+    for (let k = 1; k < 6; k++) {
+      const aa = a - k * 0.03 * (1 + i % 3);
+      ctx.fillStyle = hsl(HUES[i % 6], 90, 60, .12);
+      circle(W / 2 + Math.cos(aa) * (120 + i * 22), H / 2 + Math.sin(aa * 1.3) * (80 + i * 13), 5 - k * .6); ctx.fill();
+    }
+    ctx.fillStyle = hsl(HUES[i % 6], 90, 65, .8); circle(x, y, 3 + (i % 3)); ctx.fill();
+  }
+  ctx.shadowColor = hsl(190, 100, 60, .8); ctx.shadowBlur = 30;
+  text('ECHO LOOP', W / 2, 130, 92, '#e9fbff', 'center', '900');
+  ctx.shadowBlur = 0;
+  text('Every time you die, you come back as your own ally.', W / 2, 200, 22, hsl(290, 90, 80), 'center', '600');
+  const L = [
+    isTouch ? 'Drag anywhere to move. Your ship auto-fires at the nearest enemy.' : 'Move with the mouse or WASD. Your ship auto-fires at the nearest enemy.',
+    isTouch ? 'Tap NOVA to blast and shove enemies away.' : 'Click or press Space for a nova that blasts and shoves enemies away.',
+    'Survive 40 seconds. If you fall early, that life still becomes an echo.',
+    'Your echoes replay their exact moves every loop. Stack up to six.',
+    'Enemies chase echoes too. Use them as bait.'
+  ];
+  L.forEach((s, i) => text(s, W / 2, 268 + i * 32, 17, 'rgba(210,225,255,.88)', 'center', '500'));
+  blink(isTouch ? 'Tap to begin' : 'Click or press Space to begin', 470);
+  text('best score ' + fmt(best), W / 2, 520, 15, 'rgba(160,180,255,.6)', 'center', '600', MONO);
+}
+function drawBetween() {
+  const y = panel(340);
+  if (lastSurvived) text('LOOP ' + loopNo + ' CLEARED', W / 2, y + 52, 38, hsl(150, 90, 70), 'center', '900');
+  else text('YOU FELL AT ' + (ghosts[ghosts.length - 1].len / FPS).toFixed(1) + 's', W / 2, y + 52, 38, hsl(340, 90, 72), 'center', '900');
+  const gh = ghosts[ghosts.length - 1];
+  text(lastSurvived ? 'A full-length echo is recorded. It will fight for the whole loop.' : 'Your echo will fight until that exact moment, then fade.', W / 2, y + 96, 17, hsl(gh.hue, 90, 78), 'center', '600');
+  text('score  ' + fmt(score), W / 2, y + 150, 26, '#eaf0ff', 'center', '800');
+  text(`this loop:  you ${lstats.me} kills   echoes ${lstats.echo} kills`, W / 2, y + 190, 17, 'rgba(200,220,255,.85)', 'center', '600');
+  for (let i = 0; i < ghosts.length; i++) {
+    ctx.fillStyle = hsl(ghosts[i].hue, 90, 60, .5); ctx.strokeStyle = hsl(ghosts[i].hue, 90, 70); ctx.lineWidth = 2;
+    circle(W / 2 - (ghosts.length - 1) * 14 + i * 28, y + 232, 9); ctx.fill(); ctx.stroke();
+  }
+  text(`${ghosts.length} ${ghosts.length === 1 ? 'echo' : 'echoes'} ready for loop ${loopNo + 1}`, W / 2, y + 266, 15, 'rgba(160,180,255,.7)', 'center', '600');
+  if (overlayT > 25) blink(isTouch ? 'Tap to start loop ' + (loopNo + 1) : 'Click or press Space to start loop ' + (loopNo + 1), y + 308);
+}
+function drawOver() {
+  const y = panel(400);
+  text('TIMELINE COMPLETE', W / 2, y + 50, 38, '#e9fbff', 'center', '900');
+  const rank = score < 4000 ? 'Rookie Echo' : score < 8000 ? 'Loop Walker' : score < 13000 ? 'Time Weaver' : 'Paradox Master';
+  text(rank, W / 2, y + 94, 26, hsl(290, 90, 78), 'center', '800');
+  text(fmt(score), W / 2, y + 152, 54, '#eaf0ff', 'center', '900');
+  if (newBest) text('new best score', W / 2, y + 194, 16, hsl(50, 100, 70), 'center', '800');
+  else text('best ' + fmt(best), W / 2, y + 194, 15, 'rgba(160,180,255,.6)', 'center', '600', MONO);
+  text(`you scored ${stats.me} kills`, W / 2, y + 236, 18, hsl(190, 100, 75), 'center', '700');
+  text(`your echoes scored ${stats.echo} kills`, W / 2, y + 266, 18, hsl(290, 90, 78), 'center', '700');
+  const tot = stats.me + stats.echo;
+  if (tot) text(Math.round(stats.echo / tot * 100) + '% of the carnage was your past selves.', W / 2, y + 304, 15, 'rgba(200,220,255,.7)', 'center', '500');
+  if (overlayT > 40) blink(isTouch ? 'Tap to play again' : 'Click or press Space to play again', y + 356);
+}
+
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#04050b'; ctx.fillRect(0, 0, innerWidth, innerHeight);
+  ctx.save();
+  ctx.translate(ox, oy); ctx.scale(scale, scale);
+  ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+
+  if (state === 'title') {
+    drawTitle();
+  } else {
+    ctx.save();
+    if (shake > 0.3) ctx.translate(rnd(-shake, shake), rnd(-shake, shake));
+    drawWorld();
+    ctx.restore();
+    drawHUD();
+    if (state === 'between') drawBetween();
+    else if (state === 'over') drawOver();
+    else if (paused) {
+      ctx.fillStyle = 'rgba(5,6,15,.7)'; ctx.fillRect(0, 0, W, H);
+      text('PAUSED', W / 2, H / 2 - 12, 54, '#e9fbff', 'center', '900');
+      text(isTouch ? 'Tap to resume' : 'Click or press Space to resume', W / 2, H / 2 + 34, 18, 'rgba(160,220,255,.85)', 'center', '600');
+    }
+  }
+  ctx.restore();
+  // arena frame
+  ctx.strokeStyle = 'rgba(120,160,255,.28)'; ctx.lineWidth = 2;
+  ctx.strokeRect(ox, oy, W * scale, H * scale);
+}
+
+/* ---------- input ---------- */
+function toWorld(e) { return { x: (e.clientX - ox) / scale, y: (e.clientY - oy) / scale }; }
+function action() {
+  if (state === 'play') { if (paused) paused = false; else novaReq = true; }
+  else if (overlayT > 25) {
+    if (state === 'title' || state === 'over') newGame();
+    else if (state === 'between') startLoop();
+  }
+}
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); cv.focus();
+  const p = toWorld(e);
+  if (e.pointerType !== 'mouse') isTouch = true;
+  if (p.x > W - 44 && p.x <= W && p.y >= 0 && p.y < 44 && state !== 'title') { toggleMute(); return; }
+  if (state === 'play') {
+    if (paused) { paused = false; return; }
+    if (e.pointerType === 'mouse') {
+      pointer.x = p.x; pointer.y = p.y; pointer.active = true; novaReq = true;
+    } else if (Math.hypot(p.x - NB.x, p.y - NB.y) < NB.r + 12) {
+      novaReq = true;
+    } else {
+      movePid = e.pointerId; pointer.active = true; pointer.x = p.x; pointer.y = p.y - 45;
+    }
+  } else { action(); }
+});
+cv.addEventListener('pointermove', e => {
+  const p = toWorld(e);
+  if (e.pointerType === 'mouse') { pointer.x = p.x; pointer.y = p.y; pointer.active = true; }
+  else if (e.pointerId === movePid) { pointer.x = p.x; pointer.y = p.y - 45; }
+});
+function pointerEnd(e) {
+  if (e.pointerId === movePid) { movePid = -1; pointer.active = false; }
+}
+cv.addEventListener('pointerup', pointerEnd);
+cv.addEventListener('pointercancel', pointerEnd);
+cv.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') pointer.active = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(k)) e.preventDefault();
+  keys[k] = true;
+  if ((k === ' ' || k === 'enter') && !e.repeat) action();
+  if (k === 'm') toggleMute();
+  if ((k === 'p' || k === 'escape') && state === 'play') paused = !paused;
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; if (state === 'play') paused = true; });
+document.addEventListener('visibilitychange', () => { if (document.hidden && state === 'play') paused = true; });
+
+/* ---------- main loop ---------- */
+let last = performance.now(), acc = 0;
+function frame(now) {
+  const dt = Math.min(100, now - last); last = now; anim++;
+  if (state === 'play' && !paused) {
+    acc += dt;
+    while (acc >= STEP) {
+      step(); acc -= STEP;
+      if (state !== 'play') { acc = 0; break; }
+    }
+  } else {
+    acc = 0;
+    if (state !== 'title' && !paused) fxStep();
+    overlayT++;
+  }
+  dispScore += (score - dispScore) * 0.15;
+  if (Math.abs(score - dispScore) < 1) dispScore = score;
+  render();
+  requestAnimationFrame(frame);
+}
+overlayT = 100;
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
